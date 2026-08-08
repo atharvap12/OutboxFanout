@@ -1,0 +1,29 @@
+# Secrets. Commit .env.example instead, so a stranger knows which keys to set
+# without receiving your values.
+.env
+.env.local
+
+# Virtualenv
+.myenv/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Log files (dir kept, contents ignored via logs/.gitignore)
+logs/*.log*
+
+OutboxFanout_Design_Doc.pdf
+CLAUDE.md
+BLUEPRINT.md

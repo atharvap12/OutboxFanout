@@ -1,0 +1,34 @@
+# Everything listed here is excluded from the Docker build context.
+#
+# The context is the box of files handed to the Docker daemon before a build
+# starts. Without this file that box would include your virtualenv, your git
+# history, and a 240 KB PDF — all uploaded on every single build, and some of
+# it (like .env) baked into the image where anyone who pulls it can read it.
+
+.myenv/
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.git/
+.gitignore
+
+# Secrets never belong in an image. Configuration is injected at RUN time via
+# `environment:` in compose, not baked in at BUILD time.
+.env
+.env.*
+!.env.example
+
+*.pdf
+*.md
+!README.md
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+
+logs/
