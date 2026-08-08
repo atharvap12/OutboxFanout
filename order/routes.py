@@ -1,10 +1,4 @@
-"""HTTP layer. Thin on purpose — it translates, it does not decide.
-
-A route's job is: take the request, hand it to the service, turn the result
-into a response. Business rules live in service.py. Keeping routes thin means
-the same logic is reachable from a script or a test without pretending to be
-a web request.
-"""
+"""HTTP layer. Translates requests; business logic lives in service.py."""
 
 import uuid
 
@@ -29,46 +23,27 @@ router = APIRouter()
     "/orders",
     response_model=OrderResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Create an order (atomically, with its outbox event)",
+    summary="Create an order atomically with its outbox event",
 )
 def create_order(
     payload: OrderCreate,
     session: Session = Depends(get_session),
 ) -> Order:
-    """Accept an order and record it.
-
-    Returns 201 the moment the database transaction commits — we do NOT wait
-    for the relay, SNS, or any consumer. That is the promise the outbox
-    pattern lets us make honestly: the event is already durably recorded in
-    the same database as the order, so it cannot be lost, even though it has
-    not been sent yet.
-
-    Compare with the naive design, where the endpoint would call SNS itself.
-    Then a slow SNS makes your checkout slow, and an SNS outage makes your
-    checkout fail — for an order the customer is quite happy to place.
-    """
+    """Returns 201 as soon as the transaction commits — it does not wait for
+    the relay, SNS, or any consumer. The event is already durable in the same
+    database, so it cannot be lost despite not having been sent."""
     try:
         order = service.create_order(session, payload)
 
-        # THE transaction boundary. One commit, at the end, written by hand.
-        #
-        # Up to this instant, both rows exist only inside the transaction —
-        # invisible to everyone else, and erasable. This line is the cashier
-        # pressing CONFIRM. Afterwards both rows are real, together.
-        #
-        # It lives here, not in the dependency, because FastAPI runs a
-        # dependency's cleanup AFTER the response has gone out. A commit that
-        # failed down there would leave the customer holding a 201 for an
-        # order that does not exist.
+        # The transaction boundary. Committed here rather than in the
+        # dependency because FastAPI runs dependency cleanup after the
+        # response is sent, so a failure there could not change the status
+        # code the client already received.
         session.commit()
 
     except IntegrityError as exc:
-        # The database refused something: a NOT NULL, a foreign key, a
-        # uniqueness rule. The session has already been rolled back by the
-        # get_session dependency, so NOTHING was written — not the outbox
-        # row, and not the order either.
-        #
-        # This is the branch our Phase 1 proof exercises.
+        # A constraint rejected the write; get_session has rolled back, so
+        # neither row was stored. This is the branch the Phase 1 proof hits.
         log.error("order rejected by database constraint: %s", exc.orig)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -86,37 +61,21 @@ def create_order(
     return order
 
 
-@router.get(
-    "/orders/{order_id}",
-    response_model=OrderResponse,
-    summary="Fetch one order",
-)
+@router.get("/orders/{order_id}", response_model=OrderResponse, summary="Fetch one order")
 def get_order(
     order_id: uuid.UUID,
     session: Session = Depends(get_session),
 ) -> Order:
     order = session.get(Order, order_id)
     if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="No such order"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such order")
     return order
 
 
-# ---------------------------------------------------------------------------
-# Inspection endpoints.
-#
-# Not part of the product — these exist so you can watch the out-tray fill up
-# and drain during Phases 2-6 without opening psql. The design doc asks for
-# "visibility over cleverness"; this is that.
-# ---------------------------------------------------------------------------
+# Inspection endpoints — debugging aids, not part of the product API.
 
 
-@router.get(
-    "/outbox",
-    response_model=list[OutboxEventResponse],
-    summary="Peek at the outbox (debugging aid, not a real API)",
-)
+@router.get("/outbox", response_model=list[OutboxEventResponse], summary="Peek at the outbox")
 def list_outbox(
     unpublished_only: bool = False,
     limit: int = 50,

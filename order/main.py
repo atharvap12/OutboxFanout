@@ -1,23 +1,21 @@
 """Order Service entrypoint.
 
-Run locally:
+Local run:
     set -a; source .env; set +a
     uvicorn order.main:app --reload
-
-Then open http://localhost:8000/docs for an interactive form to poke it with.
 """
 
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from shared import config
 from shared.db import Base, engine
-from shared.log import setup
+from shared.log import correlation_scope, get_logger, setup
 
-# Importing models registers Order and OutboxEvent with Base.metadata.
-# Without this import the classes are never defined, so create_all below
-# would find nothing to create. It looks like an unused import; it is not.
+# Registers Order and OutboxEvent with Base.metadata. Looks unused; without it
+# create_all() below would find no tables to create.
 from order import models  # noqa: F401
 from order.routes import router
 
@@ -26,33 +24,17 @@ log = setup("order-service")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Runs once on startup, and once on shutdown.
-
-    Same yield-splits-a-function idea as session_scope(): everything before
-    the yield happens at boot, everything after happens on shutdown.
-    """
+    """Startup before the yield, shutdown after."""
     log.info("order service starting")
     log.info("database: %s", config.DATABASE_URL.split("@")[-1])
 
-    # Create any table that does not exist yet.
-    #
-    # create_all is idempotent: it looks first and skips what is already
-    # there. But be clear about its limit — it CREATES missing tables, it
-    # never ALTERS existing ones. Add a column to models.py and this will
-    # silently do nothing, because the table already exists.
-    #
-    # For this project that is fine: `docker compose down -v` wipes the
-    # volume and you start clean. A real system uses migrations (Alembic),
-    # which record each change as a versioned step. create_all is a first
-    # draft; migrations are version control for your schema.
+    # Creates missing tables only — it never ALTERS existing ones, so a schema
+    # change needs `docker compose down -v`. Alembic is the real answer.
     Base.metadata.create_all(bind=engine)
     log.info("tables ready: %s", ", ".join(sorted(Base.metadata.tables)))
 
     if config.BREAK_OUTBOX_INSERT:
-        log.warning("=" * 62)
-        log.warning("BREAK_OUTBOX_INSERT=1 — every POST /orders will FAIL.")
-        log.warning("This is the Phase 1 atomicity proof. Unset it to go back.")
-        log.warning("=" * 62)
+        log.warning("BREAK_OUTBOX_INSERT=1 — every POST /orders will fail (atomicity proof)")
 
     yield
 
@@ -63,10 +45,52 @@ app = FastAPI(
     title="OutboxFanout — Order Service",
     description=(
         "Accepts orders and writes them atomically alongside an outbox event. "
-        "Never talks to SNS: that is the relay's job, and the whole point."
+        "Never talks to SNS; that is the relay's job."
     ),
     version="1.0.0",
     lifespan=lifespan,
 )
+
+req_log = get_logger("request")
+
+# Paths whose logs would drown out real traffic (healthchecks, docs).
+_QUIET_PATHS = {"/health", "/docs", "/openapi.json", "/favicon.ico"}
+
+
+@app.middleware("http")
+async def correlation_middleware(request: Request, call_next):
+    """Wrap each request in a correlation scope and bracket it in the logs.
+
+    Every line emitted while handling the request — ours, SQLAlchemy's — is
+    tagged with the same id, so concurrent requests stay separable even when
+    their lines interleave.
+
+    An inbound X-Request-ID is honoured so a caller's id flows through; the
+    id is echoed back on the response either way.
+    """
+    incoming = request.headers.get("X-Request-ID")
+    quiet = request.url.path in _QUIET_PATHS
+
+    with correlation_scope(incoming) as cid:
+        if not quiet:
+            req_log.info("┌─ %s %s", request.method, request.url.path)
+
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            # Log the closing line before the exception propagates, or the
+            # request that matters most is the one with no visible end.
+            elapsed = (time.perf_counter() - started) * 1000
+            req_log.exception("└─ UNHANDLED after %.1fms", elapsed)
+            raise
+
+        elapsed = (time.perf_counter() - started) * 1000
+        if not quiet:
+            req_log.info("└─ %s in %.1fms", response.status_code, elapsed)
+
+        response.headers["X-Request-ID"] = cid
+        return response
+
 
 app.include_router(router)

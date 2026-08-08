@@ -1,21 +1,12 @@
-# Order Service dependencies.
-#
-# Deliberately per-service rather than one shared file: this service needs a
-# web framework, the relay and consumers do not. Each image installs only what
-# it actually runs — smaller images, and an honest record of what each service
-# depends on.
-#
-# Versions are pinned to a minor range for the same reason images are pinned
-# to a major version: a surprise upgrade should be a decision, not an accident.
+# Per-service, so each image installs only what it runs.
+# Pinned to a minor range: an upgrade should be a decision, not an accident.
 
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.32,<1.0
 
-# Database
 SQLAlchemy>=2.0,<2.1
-psycopg[binary]>=3.2,<4.0     # psycopg 3; [binary] ships prebuilt C libs
+psycopg[binary]>=3.2,<4.0     # psycopg 3, prebuilt binaries
 
-# pydantic comes in via fastapi, listed explicitly because our schemas.py
-# imports it directly. Depending on something you use only transitively is how
-# code breaks when an unrelated package drops a dependency.
+# Listed explicitly though fastapi pulls it in, because schemas.py imports it
+# directly.
 pydantic>=2.9,<3.0

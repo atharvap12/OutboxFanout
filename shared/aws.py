@@ -1,9 +1,6 @@
-"""boto3 clients pointed at LocalStack (or real AWS, unchanged).
+"""boto3 clients for SNS and SQS.
 
-The only difference between this project and production is the endpoint URL.
-Nothing here is LocalStack-specific in structure: drop AWS_ENDPOINT_URL and the
-same code talks to real SNS and SQS. That is the whole reason the endpoint is
-configuration rather than a hardcoded string.
+endpoint_url is the only thing making this LocalStack rather than real AWS.
 """
 
 from functools import lru_cache
@@ -13,14 +10,11 @@ from botocore.config import Config
 
 from shared import config
 
-# Retry policy applied to every client.
-#
-# "standard" mode retries throttling and transient 5xx errors with exponential
-# backoff. Worth being deliberate about: the relay's at-least-once guarantee
-# depends on publish failures being *reported*, not silently swallowed. A
-# publish that raises after exhausting retries leaves the outbox row
-# unpublished, so the next poll picks it up again. That is correct behaviour —
-# the row is the source of truth, not the SNS call.
+# Retries cover throttling and transient 5xx. Note they are also a source of
+# duplicates: if SNS accepts a publish but the ack is lost, the retry delivers
+# it twice. Standard SNS topics have no deduplication.
+# A publish that fails after all attempts must raise, so the outbox row stays
+# unpublished and the next poll retries it.
 _BOTO_CONFIG = Config(
     region_name=config.AWS_REGION,
     retries={"max_attempts": 3, "mode": "standard"},
@@ -30,7 +24,6 @@ _BOTO_CONFIG = Config(
 
 
 def _client(service_name: str):
-    """Build a boto3 client with our endpoint and credentials."""
     return boto3.client(
         service_name,
         endpoint_url=config.AWS_ENDPOINT_URL,
@@ -41,47 +34,32 @@ def _client(service_name: str):
     )
 
 
-# lru_cache gives one client per process. boto3 clients are expensive to build
-# (they parse a service model on creation) and are thread-safe once built, so
-# reusing one is both faster and correct. Creating a client per loop iteration
-# is a classic, quietly expensive mistake.
+# Cached: constructing a client parses a service model (~7ms) and the result
+# is thread-safe. Lazy via a function so importing this module costs nothing.
 @lru_cache(maxsize=1)
 def sns():
-    """Shared SNS client."""
     return _client("sns")
 
 
 @lru_cache(maxsize=1)
 def sqs():
-    """Shared SQS client."""
     return _client("sqs")
 
 
-# ---------------------------------------------------------------------------
-# Name -> identifier lookups
-#
-# ARNs and queue URLs are never hardcoded. LocalStack's free tier forgets every
-# topic and queue on restart, so identifiers change; we always resolve them
-# from the stable *name* at runtime.
-# ---------------------------------------------------------------------------
-
 def topic_arn(name: str) -> str:
-    """ARN for a topic, creating it if it does not exist.
+    """ARN for a topic, creating it if absent.
 
-    create_topic is idempotent in the AWS API: calling it for a name that
-    already exists returns the existing ARN rather than erroring. That is what
-    makes a re-runnable bootstrap possible, and it is why this is safe to call
-    on every start.
+    create_topic is idempotent — an existing name returns its ARN — which is
+    what makes a re-runnable bootstrap possible.
     """
     return sns().create_topic(Name=name)["TopicArn"]
 
 
 def queue_url(name: str) -> str:
-    """URL for an existing queue.
+    """URL for an existing queue. Deliberately does not create it.
 
-    Deliberately does NOT create it. A consumer discovering that its queue is
-    missing should fail loudly — silently creating one would mean it sits
-    polling an empty queue that nothing is subscribed to, looking healthy while
-    processing nothing. Queue creation belongs to the bootstrap step.
+    Auto-creating would leave a consumer polling an unsubscribed queue: green
+    healthchecks, zero messages, no error. Failing loudly is better. Queue
+    creation belongs to the bootstrap step.
     """
     return sqs().get_queue_url(QueueName=name)["QueueUrl"]

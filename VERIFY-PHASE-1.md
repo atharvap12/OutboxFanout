@@ -338,19 +338,61 @@ The two formats differ on purpose:
 | Terminal | `15:25:04 INFO [order-service] …` | A windscreen. You are watching live; the date is noise. |
 | File | `2026-08-07 15:25:04 INFO [order-service] order.routes (routes.py:85): …` | A flight recorder. Read days later, out of context — so it needs the date and the exact source line. |
 
-Trace one request end to end:
+### Correlation IDs
+
+Every request gets a short id, carried on **every** log line it produces, and
+bracketed with `┌─` / `└─`:
+
+```
+[60b8bac6] request:       ┌─ POST /orders
+[60b8bac6] order.service: staged order … and outbox event … (uncommitted)
+[60b8bac6] order.routes:  order … committed with its outbox event
+[60b8bac6] request:       └─ 201 in 21.8ms
+```
+
+Note the two middle lines: the first is the work, the second is the
+transaction boundary. **In the failure case you see the first without the
+second** — which is exactly what a rollback looks like from the outside.
+
+The id matters under load. Fire concurrent requests and the lines interleave:
 
 ```bash
-grep -E 'staged|committed' logs/order-service.log | tail -4
+for n in 1 2 3 4; do
+  curl -s -o /dev/null -X POST localhost:8000/orders \
+    -H 'Content-Type: application/json' \
+    -d "{\"customer_id\":\"conc-$n\",\"item\":\"Concurrent $n\",\"amount\":\"$n.00\"}" &
+done; wait
 ```
 
-```
-order.service (service.py:129): staged order … and outbox event … (not committed yet)
-order.routes  (routes.py:85):  order … committed with its outbox event
+Reconstruct any single one:
+
+```bash
+grep '\[a739f703\]' logs/order-service.log
 ```
 
-Two lines, deliberately. The first is the work; the second is the transaction
-boundary. During the failure case you will see the first without the second.
+Other things the format makes easy:
+
+```bash
+# every request and its outcome
+grep -E '┌─|└─' logs/order-service.log
+
+# slowest requests
+grep -oE '└─ [0-9]+ in [0-9.]+ms' logs/order-service.log | sort -t' ' -k4 -rn | head
+
+# everything that failed
+grep '└─ [45][0-9][0-9]' logs/order-service.log
+```
+
+The id is returned as the `X-Request-ID` response header, so a client can
+report the exact id to look up. Send that header **in** and it is used instead
+of a generated one, which is how an id follows a request across services.
+
+`--no-access-log` is set: the middleware already records method, path, status
+and duration, with the id attached — uvicorn's own access line runs outside
+the middleware and could not carry it.
+
+`/health` and `/docs` are excluded from bracketing so probes don't drown out
+real traffic.
 
 Files survive `docker compose down` because `./logs` is bind-mounted from the
 host. They rotate at 10 MB, keeping 4 spares (~50 MB cap per service), so a

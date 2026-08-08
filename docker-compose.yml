@@ -1,15 +1,8 @@
 services:
   postgres:
-    # Why ":16" and not ":latest"?
-    # ":latest" means "whatever version is newest today" — so the same file
-    # can quietly give you a different database next month.
-    # That already bit us: postgres:latest is now 18, and version 18 MOVED the
-    # folder where it keeps its data. Think of the volume below as a filing
-    # cabinet bolted to Room A. Postgres 18 moved the office to Room B. The
-    # cabinet is still bolted in Room A — empty, untouched, and nobody
-    # complains. Everything looks fine until you restart and all your tables
-    # are gone, with zero error messages.
-    # Lesson: always pin the major version.
+    # Pinned to 16 deliberately: postgres:18 moved PGDATA to
+    # /var/lib/postgresql/18/docker, which would silently orphan the volume
+    # below — data vanishes on restart with no error.
     image: postgres:16
     container_name: outboxFanout-postgres
     environment:
@@ -21,27 +14,14 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      # A healthcheck is just a question Docker asks the container over and
-      # over: "are you actually ready?" If the command exits 0, the answer is
-      # yes. "pg_isready" is Postgres's own way of answering that.
-      #
-      # The "-U myuser -d mydatabase" part is NOT optional. Without it you're
-      # walking up to the counter and asking for a person who doesn't work
-      # there — Postgres tries to log you in as "root" to a database called
-      # "root", neither of which exist. The check still passes (the building
-      # is open!) but your logs fill up with FATAL errors.
+      # -U/-d are required: bare pg_isready connects as OS user "root" to a
+      # database "root" and logs FATAL errors while still reporting healthy.
       test: ["CMD", "pg_isready", "-U", "${PG_USER}", "-d", "${PG_DB}"]
-      interval: 5s      # ask every 5 seconds
-      timeout: 3s       # if one question takes >3s, count it as a "no"
-      retries: 5        # 5 "no"s in a row = officially broken
-      # A grace period for starting up. Don't judge the restaurant as "closed"
-      # while the staff are still unlocking the door and switching the lights
-      # on. Failures during these first 10 seconds don't count against the 5
-      # retries above.
-      # Postgres needs this because on its very first run it does something
-      # sneaky: it starts a temporary server, sets up your database, shuts
-      # that server down, and THEN starts the real one. Connections fail
-      # during that gap — which is normal, not broken.
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      # First run: entrypoint starts a temp server for initdb, stops it, then
+      # starts the real one. Connections fail during that gap.
       start_period: 10s
 
   redis:
@@ -51,187 +31,79 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    # What Redis stores for us: a hand-stamp at a club door.
-    # Every time the Notifications service handles an order, it stamps that
-    # order's id ("processed:<order_id>"). If the same order shows up again,
-    # it sees the stamp and doesn't send a second email.
-    #
-    # "--appendonly yes" turns on Redis's diary.
-    # By default Redis keeps everything in its head — fast, but a restart is
-    # like amnesia. AOF (append-only file) means it also writes every note
-    # into a diary on disk, so after a restart it can re-read the diary and
-    # remember. Without this, Redis wakes up with no stamps and happily sends
-    # everyone a duplicate email.
-    #
-    # But this diary is still weaker than what Billing/Shipping get, for two
-    # reasons worth understanding:
-    #   1. Redis only pushes the diary to disk about once a second. A sudden
-    #      power cut can lose that last second of notes.
-    #   2. Stamping the hand and sending the email are two separate actions in
-    #      two separate systems. Billing/Shipping don't have this problem —
-    #      for them, writing the record IS the work, one action, one place,
-    #      all-or-nothing. Nothing can land half-done.
-    #
-    # About the volume: `docker compose down` is closing the shop for the
-    # night — the stock stays. `docker compose down -v` empties the warehouse
-    # too. We WANT the -v version before running a test, because a test that
-    # says "only one row should exist" proves nothing if yesterday's row is
-    # still sitting there. But never run -v in the MIDDLE of a demo, or you'll
-    # wipe the stamps you were about to prove work.
+    # AOF on so the processed:{order_id} dedup keys survive a restart. Still a
+    # weaker guarantee than the Postgres consumers: appendfsync everysec can
+    # lose ~1s of writes, and the key and the side effect are not in one
+    # transaction. Volume survives `down` but not `down -v`.
     command: ["redis-server", "--appendonly", "yes"]
     healthcheck:
-      # "ping" -> Redis replies "PONG". Simplest possible "are you alive?"
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
-      # Redis boots in well under a second, so this is just insurance in case
-      # the laptop is busy and the very first check arrives too early.
       start_period: 5s
 
   localstack:
-    # LocalStack is a pretend AWS running on your laptop. It imitates SNS and
-    # SQS closely enough that our code can't tell the difference — so we can
-    # build and break things all day without an AWS account or a bill.
-    #
-    # Pinned to major 3 for the same reason as Postgres above: with ":latest",
-    # an update could change how SQS/SNS behave overnight and we'd be
-    # debugging a "bug" we never wrote.
     image: localstack/localstack:3
     container_name: outboxFanout-localstack
     ports:
-      # One door for the whole building. Real AWS gives every service its own
-      # web address; LocalStack puts them all behind this single port and
-      # figures out which service you meant from the request. So there is no
-      # separate "SNS port" and "SQS port" to look for — it's all 4566.
-      - "4566:4566"
+      - "4566:4566"          # single edge port fronting all AWS APIs
     environment:
-      # More of a hint than a rule: it tells LocalStack "we'll probably use
-      # these two, feel free to warm them up." It does NOT block other
-      # services — LocalStack starts whatever you actually call. We keep it as
-      # a note-to-self about what this project genuinely uses.
-      SERVICES: sqs,sns
+      SERVICES: sqs,sns      # eager-load hint only; services load lazily anyway
       DEBUG: "0"
     volumes:
-      # IMPORTANT — this does NOT save your topic and queues.
-      # It's tempting to assume a volume means "my setup survives restarts."
-      # It doesn't here. Remembering your AWS resources is a PAID LocalStack
-      # feature; the free version is a whiteboard that gets wiped clean every
-      # time you leave the room. All this volume keeps is a few sticky notes
-      # (a security certificate, a machine id, a lookup table) that make the
-      # next startup slightly faster.
-      #
-      # So the real takeaway: every single restart destroys the SNS topic, all
-      # three SQS queues, and the subscriptions between them. That means
-      # creating them can never be a one-off command you type by hand and
-      # forget. It has to be a script you can safely re-run any number of
-      # times — which, conveniently, is also how real infrastructure is built.
-      # https://docs.localstack.cloud/aws/capabilities/state-management/persistence/
+      # Does NOT persist topics/queues — that needs PERSISTENCE=1, a paid
+      # feature. Caches only the TLS cert, machine id and service catalog.
+      # Consequence: every restart wipes the topic, queues and subscriptions,
+      # so creating them must be an idempotent bootstrap script.
       - localstack-data:/var/lib/localstack
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
       timeout: 3s
       retries: 10
-      # Measured ~20-30s to become healthy on this machine. Before we set
-      # this, the 10 retries just happened to be a big enough budget to cover
-      # boot time — it worked by luck, not on purpose.
-      start_period: 40s
+      start_period: 40s      # measured ~20-30s to first healthy response
 
-  # ===========================================================================
-  # PHASE 1 — Order Service
-  #
-  # The first service we wrote ourselves, so the first with `build:` instead
-  # of `image:`. Notice what it does NOT have: any mention of LocalStack, SNS,
-  # or SQS. It cannot reach them, and that is the design, not an oversight.
-  # ===========================================================================
   order:
     build:
-      # Context is the REPO ROOT, not ./order — the Dockerfile copies from
-      # shared/ too, and a build can only see files inside its context.
-      # The context is the box you hand the builder; anything outside the box
-      # does not exist, whatever path you write.
+      # Context must be the repo root: the Dockerfile also copies shared/.
       context: .
       dockerfile: order/Dockerfile
     ports:
       - "8000:8000"
     environment:
-      # THE address change. On your laptop Postgres is "localhost"; in here,
-      # "localhost" means this container. Services find each other by service
-      # name on the network Compose created for them.
+      # Service name, not localhost — inside a container localhost is the
+      # container itself.
       PG_HOST: postgres
       PG_PORT: 5432
       PG_USER: ${PG_USER}
       PG_PASSWORD: ${PG_PASSWORD}
       PG_DB: ${PG_DB}
-
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-
-      # Print every SQL statement. Turn on to watch both INSERTs land between
-      # one BEGIN and one COMMIT — the atomic write, made visible:
-      #   SQL_ECHO=1 docker compose up order
-      SQL_ECHO: ${SQL_ECHO:-0}
-
-      # Phase 1 STOP condition. Sabotages the outbox insert so we can prove
-      # the order insert vanishes with it:
-      #   BREAK_OUTBOX_INSERT=1 docker compose up -d order
-      BREAK_OUTBOX_INSERT: ${BREAK_OUTBOX_INSERT:-0}
+      SQL_ECHO: ${SQL_ECHO:-0}                            # log every statement
+      BREAK_OUTBOX_INSERT: ${BREAK_OUTBOX_INSERT:-0}      # Phase 1 rollback proof
     depends_on:
       postgres:
-        # NOT plain `depends_on: [postgres]`. That waits only for the
-        # container to start, and a starting Postgres refuses connections
-        # while it runs its first-time setup. This waits for the healthcheck —
-        # for someone to actually be at the counter.
+        # service_healthy, not plain depends_on: a started Postgres still
+        # refuses connections during first-run setup.
         condition: service_healthy
     volumes:
-      # Bind-mount the source so edits appear instantly and --reload picks
-      # them up. Without this, every one-line change means a full rebuild:
-      # a 2-second feedback loop instead of a 40-second one.
-      #
-      # Note these SHADOW what the Dockerfile copied in. Great for developing,
-      # wrong for shipping — a real deployment uses the baked-in code so what
-      # you tested is exactly what runs.
+      # Dev-only: shadows the code baked into the image so --reload works.
       - ./order:/app/order
       - ./shared:/app/shared
-      # Log files land on the HOST, so they outlive the container. Without
-      # this they would be written inside the container's own filesystem and
-      # vanish on every `docker compose down` — which defeats the point of
-      # having a flight recorder at all.
-      #
-      # This works because the container's appuser is uid 1000, the same as
-      # the host user, so the files are writable from both sides. If you ever
-      # see permission errors here, that mismatch is why.
+      # Log files on the host so they outlive the container. Works because
+      # container appuser and host user are both uid 1000.
       - ./logs:/app/logs
+    # --no-access-log: our correlation middleware logs method, path, status
+    # and duration with the request id. uvicorn's access line runs outside the
+    # middleware, so it would duplicate that with no id attached.
     command: >
-      uvicorn order.main:app --host 0.0.0.0 --port 8000 --reload
+      uvicorn order.main:app --host 0.0.0.0 --port 8000 --reload --no-access-log
+    # No container_name: allows `docker compose up --scale <svc>=2` later.
 
-    # No `container_name` here, unlike the infra services above. A fixed name
-    # pins you to exactly one instance, and later we may want
-    # `docker compose up --scale billing=2` to prove idempotency holds when
-    # two consumers race for the same message.
-
-  # ---------------------------------------------------------------------------
-  # WHY THE THREE INFRA SERVICES HAVE NO "depends_on"
-  #
-  # "depends_on" means "don't start me until that other thing is ready."
-  # Postgres, Redis and LocalStack don't need each other at all — Postgres
-  # doesn't care whether Redis exists. Adding depends_on between them would
-  # invent a queue where none is needed and slow startup down for nothing.
-  #
-  # It belongs on the app services, which genuinely cannot work before their
-  # backing store is up. `order` above is the first; still to come:
-  #
-  #   relay:              depends_on: { postgres:   {...}, localstack: {...} }
-  #   billing-consumer:   depends_on: { postgres:   {...}, localstack: {...} }
-  #   shipping-consumer:  depends_on: { postgres:   {...}, localstack: {...} }
-  #   notify-consumer:    depends_on: { redis:      {...}, localstack: {...} }
-  #
-  # ALSO DELIBERATELY MISSING: any "restart:" policy.
-  # A self-restarting container would be a fire drill in a building that puts
-  # its own fires out. Half this project is proving what happens when things
-  # break — killing the relay mid-job, taking a consumer offline — and we
-  # can't observe any of that if Docker keeps quietly reviving them.
-  # ---------------------------------------------------------------------------
+  # No depends_on between postgres/redis/localstack — they are independent.
+  # No restart: policies anywhere: auto-restart would undo the fault-injection
+  # scenarios (kill the relay mid-loop, take a consumer offline).
 
 volumes:
   postgres-data:

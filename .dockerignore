@@ -1,9 +1,6 @@
-# Everything listed here is excluded from the Docker build context.
-#
-# The context is the box of files handed to the Docker daemon before a build
-# starts. Without this file that box would include your virtualenv, your git
-# history, and a 240 KB PDF — all uploaded on every single build, and some of
-# it (like .env) baked into the image where anyone who pulls it can read it.
+# Excluded from the build context: uploaded on every build otherwise, and
+# .env would be baked into the image where anyone pulling it could read it.
+# Configuration is injected at run time via `environment:`, not at build time.
 
 .myenv/
 venv/
@@ -15,8 +12,6 @@ __pycache__/
 .git/
 .gitignore
 
-# Secrets never belong in an image. Configuration is injected at RUN time via
-# `environment:` in compose, not baked in at BUILD time.
 .env
 .env.*
 !.env.example
