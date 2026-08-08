@@ -202,8 +202,15 @@ services:
       # the host user, so the files are writable from both sides. If you ever
       # see permission errors here, that mismatch is why.
       - ./logs:/app/logs
+    # --no-access-log turns OFF uvicorn's own "GET /orders 201" line.
+    #
+    # Not because access logs are unwanted — because we already write a better
+    # one. Our correlation middleware records the method, path, status AND the
+    # duration, tagged with the request id. uvicorn's version runs outside
+    # that middleware, so the scope has already closed and its line would be
+    # tagged "--------" — a duplicate that cannot be traced back to anything.
     command: >
-      uvicorn order.main:app --host 0.0.0.0 --port 8000 --reload
+      uvicorn order.main:app --host 0.0.0.0 --port 8000 --reload --no-access-log
 
     # No `container_name` here, unlike the infra services above. A fixed name
     # pins you to exactly one instance, and later we may want

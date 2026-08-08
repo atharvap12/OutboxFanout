@@ -64,4 +64,9 @@ EXPOSE 8000
 #
 # This is the flip side of the localhost lesson: inside a container, localhost
 # is a smaller world than you think.
-CMD ["uvicorn", "order.main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# --no-access-log switches off uvicorn's own request line, because our
+# correlation middleware already logs the method, path, status, duration and
+# request id together. uvicorn's line runs outside that middleware, so it
+# would arrive untagged — a duplicate you cannot trace.
+CMD ["uvicorn", "order.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
