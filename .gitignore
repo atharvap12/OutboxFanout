@@ -27,3 +27,5 @@ logs/*.log*
 OutboxFanout_Design_Doc.pdf
 CLAUDE.md
 BLUEPRINT.md
+
+VERIFY/
