@@ -20,6 +20,26 @@ cd ~/Projects/OutboxFanout
 set -a; source .env; set +a      # .env does NOT auto-export into your shell
 ```
 
+### Readiness helper
+
+`docker compose up -d` returns when the container has **started**, not when the
+app is ready — uvicorn still has to boot, import the app, connect to Postgres
+and create tables (~3s, during which `curl` gets `connection refused`).
+
+Paste once per shell; used instead of `sleep` throughout:
+
+```bash
+until_ready() {
+  for _ in $(seq 1 40); do
+    curl -sf localhost:8000/health >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  echo "order service did not become ready" >&2; return 1
+}
+```
+
+Same distinction as `Up` vs `(healthy)`: a sleep is a guess, a poll is a fact.
+
 ---
 
 ## Step 1 — Start the stack
@@ -50,7 +70,7 @@ An idempotency-style proof is meaningless against leftover data. Reset first:
 ```bash
 docker compose down -v           # -v deletes the volumes too
 docker compose up -d order
-sleep 10
+until_ready
 ```
 
 Confirm both tables are empty:
@@ -150,11 +170,30 @@ docker compose exec -T postgres psql -U $PG_USER -d $PG_DB \
 
 ```bash
 BREAK_OUTBOX_INSERT=1 docker compose up -d order
-sleep 8
+until_ready
 docker compose logs order --tail 5 | grep BREAK
 ```
 
 You should see the loud warning banner.
+
+> **The `VAR=value command` prefix sets the variable for the `docker compose`
+> process, not for the container.** A running process's environment cannot be
+> changed from outside. Compose uses it to interpolate
+> `${BREAK_OUTBOX_INSERT:-0}`, sees the desired config no longer matches the
+> running container, and **recreates** it — it prints `Recreate` → `Recreated`
+> and `docker compose ps -q order` returns a new container ID. So the service
+> is restarted; `up -d` just does it for you, no explicit `down` needed.
+>
+> **Use `up -d`, not `restart`.** `docker compose restart` reuses the same
+> container with the environment it was created with, so the flag will not
+> change. Confirm what is live with:
+>
+> ```bash
+> docker compose exec order printenv BREAK_OUTBOX_INSERT
+> ```
+>
+> The inline prefix is preferred over editing `.env` because it applies to one
+> command only — nothing left switched on afterwards.
 
 ### 4c. Send an order that must fail
 
@@ -195,7 +234,7 @@ The counts prove the outcome; this shows the mechanism.
 
 ```bash
 SQL_ECHO=1 BREAK_OUTBOX_INSERT=1 docker compose up -d order
-sleep 8
+until_ready
 
 curl -s -o /dev/null -X POST localhost:8000/orders \
   -H 'Content-Type: application/json' \
@@ -224,7 +263,7 @@ Compare with the happy path, which ends `BEGIN … INSERT … INSERT … COMMIT`
 
 ```bash
 docker compose up -d order
-sleep 8
+until_ready
 curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/orders \
   -H 'Content-Type: application/json' \
   -d '{"customer_id":"cust-7","item":"Desk lamp","amount":"89.50"}'
