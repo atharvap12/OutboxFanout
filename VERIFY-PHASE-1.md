@@ -20,6 +20,30 @@ cd ~/Projects/OutboxFanout
 set -a; source .env; set +a      # .env does NOT auto-export into your shell
 ```
 
+### Define a readiness helper
+
+`docker compose up -d` returns as soon as the container is **started**, not
+when the app inside it is **ready to serve**. Recreating the container means
+uvicorn still has to boot, import the app, connect to Postgres and create
+tables — about 3 seconds here, during which `curl` gets
+`connection refused`.
+
+Paste this once per shell and use it instead of guessing with `sleep`:
+
+```bash
+until_ready() {
+  for _ in $(seq 1 40); do
+    curl -sf localhost:8000/health >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  echo "order service did not become ready" >&2; return 1
+}
+```
+
+Same lesson as Phase 0's `Up` vs `(healthy)`: a sleep is a guess that is
+either too short (flaky) or too long (slow). Polling the thing you actually
+care about is a fact.
+
 ---
 
 ## Step 1 — Start the stack
@@ -50,7 +74,7 @@ An idempotency-style proof is meaningless against leftover data. Reset first:
 ```bash
 docker compose down -v           # -v deletes the volumes too
 docker compose up -d order
-sleep 10
+until_ready                      # wait for readiness, don't guess
 ```
 
 Confirm both tables are empty:
@@ -150,11 +174,37 @@ docker compose exec -T postgres psql -U $PG_USER -d $PG_DB \
 
 ```bash
 BREAK_OUTBOX_INSERT=1 docker compose up -d order
-sleep 8
+until_ready                      # wait for readiness, don't guess
 docker compose logs order --tail 5 | grep BREAK
 ```
 
 You should see the loud warning banner.
+
+> **What that `VAR=value command` prefix actually does.** It sets the variable
+> for the `docker compose` process only — not for the running container. An
+> already-running process's environment cannot be changed from outside, by
+> Docker or anything else.
+>
+> Compose reads it while interpolating `${BREAK_OUTBOX_INSERT:-0}` in
+> `docker-compose.yml`, compares that desired config against the running
+> container, sees a difference, and **recreates the container**. Watch the
+> output — it prints `Recreate` → `Recreated`, and `docker compose ps -q order`
+> returns a different container ID afterwards.
+>
+> So the service *is* restarted, exactly as you'd expect. You just don't need
+> an explicit `down` — `up -d` is declarative: it converges reality to the
+> config.
+>
+> **Use `up -d`, never `restart`.** `docker compose restart` restarts the
+> *same* container with the environment it was created with, so the flag will
+> not change and you'll be debugging a test that refuses to fail:
+>
+> ```bash
+> docker compose exec order printenv BREAK_OUTBOX_INSERT   # confirm what's live
+> ```
+>
+> The inline prefix is preferred over editing `.env` because it applies to one
+> command only — there is no flag left switched on tomorrow.
 
 ### 4c. Send an order that must fail
 
@@ -195,7 +245,7 @@ The counts prove the outcome; this shows the mechanism.
 
 ```bash
 SQL_ECHO=1 BREAK_OUTBOX_INSERT=1 docker compose up -d order
-sleep 8
+until_ready                      # wait for readiness, don't guess
 
 curl -s -o /dev/null -X POST localhost:8000/orders \
   -H 'Content-Type: application/json' \
@@ -224,7 +274,7 @@ Compare with the happy path, which ends `BEGIN … INSERT … INSERT … COMMIT`
 
 ```bash
 docker compose up -d order
-sleep 8
+until_ready                      # wait for readiness, don't guess
 curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/orders \
   -H 'Content-Type: application/json' \
   -d '{"customer_id":"cust-7","item":"Desk lamp","amount":"89.50"}'
