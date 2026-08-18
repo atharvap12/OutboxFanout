@@ -83,7 +83,12 @@ def list_outbox(
 ) -> list[OutboxEvent]:
     stmt = select(OutboxEvent).order_by(OutboxEvent.created_at.desc()).limit(limit)
     if unpublished_only:
-        stmt = stmt.where(OutboxEvent.published.is_(False))
+        # `== False`, not `.is_(False)`: the partial index is declared
+        # `WHERE published = false`, and Postgres's predicate prover does not
+        # recognise `IS false` as implying it — measured at a seq scan over
+        # 50k rows instead of an index scan. Verified with EXPLAIN, see
+        # VERIFY/VERIFY-PHASE-2.md.
+        stmt = stmt.where(OutboxEvent.published == False)  # noqa: E712
     return list(session.scalars(stmt))
 
 

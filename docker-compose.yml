@@ -101,6 +101,48 @@ services:
       uvicorn order.main:app --host 0.0.0.0 --port 8000 --reload --no-access-log
     # No container_name: allows `docker compose up --scale <svc>=2` later.
 
+  relay:
+    build:
+      context: .
+      dockerfile: relay/Dockerfile
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DB: ${PG_DB}
+      # localstack, not localhost — same container-addressing rule as PG_HOST.
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      # Ignored by LocalStack, but boto3 signs before sending, so absent
+      # credentials fail before the request leaves the container.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SNS_TOPIC_NAME: ${SNS_TOPIC_NAME:-order-events}
+      RELAY_POLL_INTERVAL_SECONDS: ${RELAY_POLL_INTERVAL_SECONDS:-2}
+      RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-10}
+      CRASH_AFTER_PUBLISH: ${CRASH_AFTER_PUBLISH:-0}   # Scenario A
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SQL_ECHO: ${SQL_ECHO:-0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      # Deliberately NOT depends_on order. The relay reads a table the Order
+      # Service creates, but coupling them would mean the relay cannot run
+      # while the API is down — the opposite of the independence this split
+      # exists to provide. A missing table is logged and retried instead.
+    volumes:
+      - ./relay:/app/relay
+      - ./order:/app/order     # for order.models only
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+    # Default is 10s. Our loop notices SIGTERM within one poll interval, so a
+    # shorter grace period keeps `docker compose stop` snappy without ever
+    # reaching the SIGKILL that would fake a Scenario A crash.
+    stop_grace_period: 5s
+
   # No depends_on between postgres/redis/localstack — they are independent.
   # No restart: policies anywhere: auto-restart would undo the fault-injection
   # scenarios (kill the relay mid-loop, take a consumer offline).

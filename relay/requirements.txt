@@ -1,0 +1,7 @@
+# Per-service, so each image installs only what it runs. Note there is no
+# fastapi/uvicorn here — the relay is a plain process with no HTTP surface.
+
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4.0     # psycopg 3, prebuilt binaries
+
+boto3>=1.35,<2.0              # SNS client; botocore comes with it
