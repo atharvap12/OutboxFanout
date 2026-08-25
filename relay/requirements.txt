@@ -1,0 +1,9 @@
+# Relay dependencies only, so the image installs just what it runs. Note what
+# is absent: fastapi and uvicorn — the relay has no HTTP surface at all.
+#
+# Ranges, not open ends: ">=2.0,<2.1" allows bugfixes but never 2.1, so a minor
+# upgrade is a decision rather than something that happens on a rebuild.
+
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4.0     # psycopg 3; [binary] needs no compiler
+boto3>=1.35,<2.0              # pulls in botocore (ClientError, retry config)

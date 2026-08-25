@@ -217,6 +217,92 @@ services:
     # `docker compose up --scale billing=2` to prove idempotency holds when
     # two consumers race for the same message.
 
+  # ===========================================================================
+  # PHASE 2 — Outbox Relay
+  #
+  # The courier: checks the out-tray every 2s, carries letters to the post
+  # office (SNS), ticks them off. Note the mirror image of `order` above —
+  # order talks to Postgres and never to LocalStack; relay talks to both and
+  # has no HTTP port. That split is the outbox pattern drawn as infrastructure.
+  # ===========================================================================
+  relay:
+    build:
+      context: .
+      dockerfile: relay/Dockerfile
+
+    # No `ports:` — and that absence is meaningful. `ports` publishes a port so
+    # you can reach a container. Nothing ever calls the relay; it only makes
+    # outgoing calls.
+
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DB: ${PG_DB}
+
+      # "localstack", not "localhost" — same address lesson as PG_HOST. This is
+      # the SDKs' own standard variable name, so boto3 and the AWS CLI honour it
+      # with no glue. Delete it and the identical code talks to real AWS.
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+
+      # LocalStack ignores the values, but they are still REQUIRED: boto3 signs
+      # every request BEFORE sending, and signing needs a key. Without them the
+      # request never leaves the container. Credentials are a client concern.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+
+      # A NAME, not an ARN — LocalStack forgets topics on restart so the
+      # generated address changes, but the name never does.
+      SNS_TOPIC_NAME: ${SNS_TOPIC_NAME:-order-events}
+
+      # A bigger batch drains a backlog faster. It does NOT increase crash
+      # damage, because the relay commits one row at a time.
+      RELAY_POLL_INTERVAL_SECONDS: ${RELAY_POLL_INTERVAL_SECONDS:-2}
+      RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-10}
+
+      # SCENARIO A. Exits after publishing but before ticking the row off, so a
+      # restart sends the same event twice:
+      #   CRASH_AFTER_PUBLISH=1 docker compose up -d relay
+      CRASH_AFTER_PUBLISH: ${CRASH_AFTER_PUBLISH:-0}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SQL_ECHO: ${SQL_ECHO:-0}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        # LocalStack takes 20-30s to go healthy. Without waiting, the relay
+        # starts first, fails to create the topic, and recovers on a later poll
+        # — it works, but the first thing in your logs is a scary traceback.
+        condition: service_healthy
+
+      # DELIBERATELY ABSENT: `order`. The dependency is real (Order creates the
+      # tables), but declaring it would stop the relay running while the API is
+      # down — the opposite of the independence this split exists to provide.
+      # A missing table is logged and retried instead. Resilience over ordering.
+
+    volumes:
+      - ./relay:/app/relay
+      - ./order:/app/order      # for order.models only — see relay/Dockerfile
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+
+    # Default is 10s. Our loop notices SIGTERM within one poll interval (it
+    # sleeps on an Event, not time.sleep), so 5s is generous.
+    #
+    # This number matters: a grace period shorter than the poll interval means
+    # every ordinary stop ends in SIGKILL — which can land between publish and
+    # tick-off, producing Scenario A by accident on every deploy.
+    stop_grace_period: 5s
+
+    # No `container_name`, so you can run two:
+    #   docker compose up -d --scale relay=2
+    # They split the backlog and publish nothing twice, thanks to
+    # SELECT ... FOR UPDATE SKIP LOCKED. Worth watching once.
+
   # ---------------------------------------------------------------------------
   # WHY THE THREE INFRA SERVICES HAVE NO "depends_on"
   #
@@ -228,7 +314,7 @@ services:
   # It belongs on the app services, which genuinely cannot work before their
   # backing store is up. `order` above is the first; still to come:
   #
-  #   relay:              depends_on: { postgres:   {...}, localstack: {...} }
+  #   relay:              DONE (Phase 2, above)
   #   billing-consumer:   depends_on: { postgres:   {...}, localstack: {...} }
   #   shipping-consumer:  depends_on: { postgres:   {...}, localstack: {...} }
   #   notify-consumer:    depends_on: { redis:      {...}, localstack: {...} }
