@@ -85,3 +85,20 @@ def queue_url(name: str) -> str:
     processing nothing. Queue creation belongs to the bootstrap step.
     """
     return sqs().get_queue_url(QueueName=name)["QueueUrl"]
+
+
+def queue_arn(url: str) -> str:
+    """ARN for a queue, given its URL.
+
+    One queue, two identifiers, and they are NOT interchangeable:
+
+        URL   what you receive and delete against  (an https address)
+        ARN   what SNS subscribes to, and what IAM policies name
+
+    Nothing converts one into the other by string manipulation — you have to
+    ask. This is that ask.
+    """
+    attributes = sqs().get_queue_attributes(
+        QueueUrl=url, AttributeNames=["QueueArn"]
+    )["Attributes"]
+    return attributes["QueueArn"]

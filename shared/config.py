@@ -191,6 +191,17 @@ SQS_MAX_MESSAGES = _get_int("SQS_MAX_MESSAGES", 10)   # 10 is the SQS maximum
 # way to force duplicates in Scenario B, but not what you want by default).
 SQS_VISIBILITY_TIMEOUT_SECONDS = _get_int("SQS_VISIBILITY_TIMEOUT_SECONDS", 30)
 
+# How long an unread message survives in a queue before SQS throws it away.
+# 4 days is the AWS default (14 is the maximum).
+#
+# Worth noticing how this interacts with NOTIFY_DEDUP_TTL_SECONDS above: the
+# Redis dedup key expires after 48h, but a message can sit in a queue for 4
+# days. A redelivery arriving after the key expired would look like a brand new
+# event, and the customer would get a second email. Unlikely, but real — and
+# the Postgres consumers have no such window, because their dedup rows never
+# expire.
+SQS_MESSAGE_RETENTION_SECONDS = _get_int("SQS_MESSAGE_RETENTION_SECONDS", 345_600)
+
 
 # --------------------------------------------------------------------------
 # Logging

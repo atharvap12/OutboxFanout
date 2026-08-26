@@ -225,7 +225,66 @@ services:
   # order talks to Postgres and never to LocalStack; relay talks to both and
   # has no HTTP port. That split is the outbox pattern drawn as infrastructure.
   # ===========================================================================
+  # ===========================================================================
+  # PHASE 3 — Bootstrap (a setup STEP, not a service)
+  #
+  # Creates the SNS topic, the three SQS queues, their access policies and the
+  # subscriptions — then EXITS. Everything else here runs forever; this runs
+  # once. It re-runs on every `up` because LocalStack forgets every resource on
+  # restart, and it is idempotent so that costs nothing.
+  #
+  # WHY A CONTAINER, for something that is only setup?
+  # Because Compose has exactly one way to say "run this once, and prove it
+  # finished before starting Y": a container plus
+  # `service_completed_successfully`. A healthcheck can only ever answer "is it
+  # alive" — never "has it finished".
+  #
+  # (LocalStack init hooks are the obvious alternative, and they do not work
+  # here: /_localstack/health turns green while those hooks are STILL RUNNING,
+  # so the relay would be released too early and could publish into a topic
+  # with no subscribers — which SNS accepts and silently discards. A shell hook
+  # also cannot read shared/config.py, so the queue names would have to be
+  # written down a second time. And this script is plain boto3: drop
+  # AWS_ENDPOINT_URL and it provisions real AWS unchanged.)
+  # ===========================================================================
+  bootstrap:
+    # The SAME image as the relay, named explicitly.
+    #
+    # Without an `image:` key, Compose names images after the SERVICE — so
+    # pointing two services at one Dockerfile would quietly build and tag two
+    # identical copies. Naming both makes it build once.
+    image: outboxfanout-relay
+    build:
+      context: .
+      dockerfile: relay/Dockerfile
+    command: python -m bootstrap.main
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SNS_TOPIC_NAME: ${SNS_TOPIC_NAME:-order-events}
+      BILLING_QUEUE_NAME: ${BILLING_QUEUE_NAME:-billing-queue}
+      SHIPPING_QUEUE_NAME: ${SHIPPING_QUEUE_NAME:-shipping-queue}
+      NOTIFY_QUEUE_NAME: ${NOTIFY_QUEUE_NAME:-notify-queue}
+      SQS_VISIBILITY_TIMEOUT_SECONDS: ${SQS_VISIBILITY_TIMEOUT_SECONDS:-30}
+      SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
+      # Required because shared/config.py reads it at import time, even though
+      # this script never opens a database connection.
+      PG_PASSWORD: ${PG_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ./bootstrap:/app/bootstrap
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+
   relay:
+    # Shared with `bootstrap` above, which runs this same image with a
+    # different command.
+    image: outboxfanout-relay
     build:
       context: .
       dockerfile: relay/Dockerfile
@@ -278,6 +337,15 @@ services:
         # starts first, fails to create the topic, and recovers on a later poll
         # — it works, but the first thing in your logs is a scary traceback.
         condition: service_healthy
+      bootstrap:
+        # Waits for bootstrap to EXIT 0 — not merely to start.
+        #
+        # This is load-bearing. SNS accepts a message with no subscribers and
+        # silently throws it away, so a relay publishing before the queues were
+        # wired would lose those events with NO error anywhere. This ordering
+        # is the difference between "wired up" and "quietly dropping the first
+        # orders after every restart".
+        condition: service_completed_successfully
 
       # DELIBERATELY ABSENT: `order`. The dependency is real (Order creates the
       # tables), but declaring it would stop the relay running while the API is

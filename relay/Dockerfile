@@ -38,6 +38,13 @@ COPY order/ ./order/
 
 COPY relay/ ./relay/
 
+# The bootstrap script rides along in THIS image rather than getting one of its
+# own. It needs exactly what the relay needs — boto3 and shared/ — and building
+# a second image for a script that runs for two seconds is not worth it. The
+# `bootstrap` service in docker-compose.yml is this same image with a different
+# command.
+COPY bootstrap/ ./bootstrap/
+
 RUN useradd --create-home --shell /bin/bash appuser \
     && chown -R appuser:appuser /app
 USER appuser
