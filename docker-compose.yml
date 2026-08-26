@@ -101,7 +101,57 @@ services:
       uvicorn order.main:app --host 0.0.0.0 --port 8000 --reload --no-access-log
     # No container_name: allows `docker compose up --scale <svc>=2` later.
 
+  # Not a service — a setup step. It creates the SNS topic, the 3 SQS queues,
+  # their policies and the subscriptions, then EXITS. It runs on every `up`
+  # because LocalStack forgets every resource on restart, and it is idempotent
+  # so re-running costs nothing.
+  #
+  # Why a container at all, for something that is only setup? Because Compose
+  # has exactly one way to express "run this once and prove it finished before
+  # starting Y": a container plus `service_completed_successfully`. A
+  # healthcheck can only answer "is it alive", never "has it completed".
+  #
+  # (LocalStack init hooks are the alternative, but /_localstack/health goes
+  # green while hooks are still running — so the relay would be released too
+  # early — and a shell hook cannot read shared/config.py, so queue names would
+  # be duplicated. This is also plain boto3: drop AWS_ENDPOINT_URL and the same
+  # script provisions real AWS.)
+  bootstrap:
+    # Same image as the relay, declared explicitly. Without an `image:` key
+    # Compose names images after the SERVICE, so it would build and tag a
+    # second identical copy. Naming both the same makes it build once.
+    image: outboxfanout-relay
+    build:
+      context: .
+      dockerfile: relay/Dockerfile
+    command: python -m bootstrap.main
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SNS_TOPIC_NAME: ${SNS_TOPIC_NAME:-order-events}
+      BILLING_QUEUE_NAME: ${BILLING_QUEUE_NAME:-billing-queue}
+      SHIPPING_QUEUE_NAME: ${SHIPPING_QUEUE_NAME:-shipping-queue}
+      NOTIFY_QUEUE_NAME: ${NOTIFY_QUEUE_NAME:-notify-queue}
+      SQS_VISIBILITY_TIMEOUT_SECONDS: ${SQS_VISIBILITY_TIMEOUT_SECONDS:-30}
+      SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
+      # PG_PASSWORD is required by shared/config.py at import, though this
+      # script never opens a database connection.
+      PG_PASSWORD: ${PG_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      localstack:
+        condition: service_healthy
+    volumes:
+      - ./bootstrap:/app/bootstrap
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+
   relay:
+    # Shared with the `bootstrap` service above, which runs the same image
+    # with a different command.
+    image: outboxfanout-relay
     build:
       context: .
       dockerfile: relay/Dockerfile
@@ -129,6 +179,11 @@ services:
         condition: service_healthy
       localstack:
         condition: service_healthy
+      bootstrap:
+        # Waits for bootstrap to EXIT 0, not merely to start. Without it the
+        # relay could publish before the queues are subscribed, and those
+        # messages would go nowhere — SNS drops a message with no subscribers.
+        condition: service_completed_successfully
       # Deliberately NOT depends_on order. The relay reads a table the Order
       # Service creates, but coupling them would mean the relay cannot run
       # while the API is down — the opposite of the independence this split

@@ -141,6 +141,12 @@ SQS_MAX_MESSAGES = _get_int("SQS_MAX_MESSAGES", 10)             # 10 = SQS max
 # delivery test.
 SQS_VISIBILITY_TIMEOUT_SECONDS = _get_int("SQS_VISIBILITY_TIMEOUT_SECONDS", 30)
 
+# How long an unconsumed message survives in a queue. 4 days is the SQS
+# default (max 14). Note the interaction with NOTIFY_DEDUP_TTL_SECONDS above:
+# retention longer than the Redis TTL means a very late redelivery could be
+# treated as new. The Postgres consumers have no expiry and dedupe forever.
+SQS_MESSAGE_RETENTION_SECONDS = _get_int("SQS_MESSAGE_RETENTION_SECONDS", 345_600)
+
 
 # --------------------------------------------------------------------------
 # Logging
