@@ -41,9 +41,25 @@ def sns():
     return _client("sns")
 
 
+# SQS needs its own config: long polling holds the HTTP response open for
+# SQS_WAIT_TIME_SECONDS, so a read_timeout shorter than that turns every
+# receive into a ReadTimeoutError — the connection is fine, we just hung up
+# before the server was done waiting. The margin covers the round trip.
+_SQS_CONFIG = _BOTO_CONFIG.merge(
+    Config(read_timeout=config.SQS_WAIT_TIME_SECONDS + 10)
+)
+
+
 @lru_cache(maxsize=1)
 def sqs():
-    return _client("sqs")
+    return boto3.client(
+        "sqs",
+        endpoint_url=config.AWS_ENDPOINT_URL,
+        aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+        region_name=config.AWS_REGION,
+        config=_SQS_CONFIG,
+    )
 
 
 def topic_arn(name: str) -> str:

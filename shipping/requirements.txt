@@ -1,0 +1,6 @@
+# Per-service. No fastapi/uvicorn: a consumer has no HTTP surface.
+
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4.0     # psycopg 3, prebuilt binaries
+
+boto3>=1.35,<2.0              # SQS client; botocore comes with it
