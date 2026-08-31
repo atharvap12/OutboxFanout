@@ -371,6 +371,144 @@ services:
     # They split the backlog and publish nothing twice, thanks to
     # SELECT ... FOR UPDATE SKIP LOCKED. Worth watching once.
 
+  # ===========================================================================
+  # PHASE 4 — THE TWO POSTGRES-IDEMPOTENT CONSUMERS
+  #
+  # Same mechanism (a UNIQUE constraint on order_id), different queue,
+  # different table, DIFFERENT IMAGE. The duplication is deliberate: these are
+  # independent services, and the whole claim of this architecture is that one
+  # can fail, stop, or be redeployed without the other noticing.
+  # ===========================================================================
+
+  billing:
+    build:
+      context: .
+      dockerfile: billing/Dockerfile
+
+    # No `image:` shared with anything, unlike bootstrap/relay. Two SERVICES
+    # sharing an image share a release; a service and a one-shot script can.
+
+    # No `ports:` — nothing ever calls a consumer. It only makes outgoing calls
+    # to SQS and Postgres.
+
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DB: ${PG_DB}
+
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+
+      # A NAME, not a URL. LocalStack forgets queues on restart so the URL
+      # changes; the name never does, and the consumer resolves it at runtime.
+      #
+      # Note it gets ONLY its own queue name. Billing has no way to accidentally
+      # read shipping-queue, because it was never told it exists.
+      BILLING_QUEUE_NAME: ${BILLING_QUEUE_NAME:-billing-queue}
+
+      # 20 = the SQS maximum, and the whole point of long polling: wait at the
+      # queue instead of asking it repeatedly whether anything arrived.
+      SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
+      # 10 = the SQS maximum per receive call. One round trip, ten messages.
+      SQS_MAX_MESSAGES: ${SQS_MAX_MESSAGES:-10}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SQL_ECHO: ${SQL_ECHO:-0}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      bootstrap:
+        # The queue must EXIST before we poll it. aws.queue_url() deliberately
+        # refuses to create a missing queue, so without this the consumer would
+        # boot into a loop of NonExistentQueue errors.
+        condition: service_completed_successfully
+
+      # DELIBERATELY ABSENT: `order` and `relay`.
+      #
+      # Billing does not care whether the API is accepting orders or whether
+      # the relay is publishing. Its work arrives on a durable queue that holds
+      # messages for days. Declaring those dependencies would couple three
+      # independent failure domains back together and make Scenario C
+      # ("one consumer down, others healthy") untestable.
+
+    volumes:
+      # Dev-only bind mounts: these SHADOW the code baked into the image, so an
+      # edit + restart is instant. Right for development, wrong for shipping —
+      # a real deployment must run the baked-in code, or what you tested is not
+      # what runs.
+      - ./billing:/app/billing
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+
+    # ------------------------------------------------------------------------
+    # 25s, versus the relay's 5s. NOT a copy-paste slip.
+    #
+    # `docker compose stop` sends SIGTERM, waits this long, then SIGKILLs.
+    # Our loop handles SIGTERM by finishing the current message and returning —
+    # but it can only notice the signal once receive_message() comes back, and
+    # a long poll blocks for up to 20 SECONDS and cannot be interrupted.
+    #
+    # With the default 10s, every ordinary `compose stop` would SIGKILL the
+    # consumer mid-wait. That is not merely untidy: SIGKILL during a handler is
+    # exactly the crash-between-process-and-delete case, so a shorter grace
+    # period would MANUFACTURE the failure we are trying to test on demand —
+    # on every single deploy. Measured clean stop: ~8s.
+    # ------------------------------------------------------------------------
+    stop_grace_period: 25s
+
+    # No container_name, so `--scale billing=3` works. Worth trying once: three
+    # consumers on one queue split the messages (SQS hands each message to one
+    # receiver at a time), and the UNIQUE constraint covers the rest.
+
+  shipping:
+    # Same shape as billing. Only the queue name, the mounted directory and the
+    # image differ — which is precisely the claim being made.
+    build:
+      context: .
+      dockerfile: shipping/Dockerfile
+
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DB: ${PG_DB}
+
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+
+      SHIPPING_QUEUE_NAME: ${SHIPPING_QUEUE_NAME:-shipping-queue}
+
+      SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
+      SQS_MAX_MESSAGES: ${SQS_MAX_MESSAGES:-10}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SQL_ECHO: ${SQL_ECHO:-0}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+
+    volumes:
+      - ./shipping:/app/shipping
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+
+    stop_grace_period: 25s   # see the long note under billing
+
   # ---------------------------------------------------------------------------
   # WHY THE THREE INFRA SERVICES HAVE NO "depends_on"
   #
@@ -383,9 +521,12 @@ services:
   # backing store is up. `order` above is the first; still to come:
   #
   #   relay:              DONE (Phase 2, above)
-  #   billing-consumer:   depends_on: { postgres:   {...}, localstack: {...} }
-  #   shipping-consumer:  depends_on: { postgres:   {...}, localstack: {...} }
+  #   billing:            DONE (Phase 4, above) — postgres + localstack
+  #   shipping:           DONE (Phase 4, above) — postgres + localstack
   #   notify-consumer:    depends_on: { redis:      {...}, localstack: {...} }
+  #
+  # Note the notify consumer will depend on REDIS, not postgres — its dedup
+  # store is different, which is the entire point of Phase 5.
   #
   # ALSO DELIBERATELY MISSING: any "restart:" policy.
   # A self-restarting container would be a fire drill in a building that puts

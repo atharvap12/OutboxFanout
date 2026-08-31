@@ -1,0 +1,10 @@
+# Billing's OWN dependency list, not shared with the Order Service.
+#
+# Note what is absent: fastapi and uvicorn. A consumer has no HTTP surface, so
+# shipping a web framework in its image would be dead weight and extra attack
+# surface. Per-service requirements are what let you notice that.
+
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4.0     # psycopg 3, prebuilt binaries (no local compiler)
+
+boto3>=1.35,<2.0              # SQS client; botocore comes along with it

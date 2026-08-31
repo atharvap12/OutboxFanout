@@ -1,0 +1,8 @@
+# Shipping's own list. Identical to Billing's TODAY — and kept separate anyway,
+# because the moment one consumer needs a courier SDK the other should not have
+# to grow it too.
+
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4.0     # psycopg 3, prebuilt binaries
+
+boto3>=1.35,<2.0              # SQS client; botocore comes along with it

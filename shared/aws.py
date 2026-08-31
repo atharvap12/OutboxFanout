@@ -51,10 +51,47 @@ def sns():
     return _client("sns")
 
 
+# ---------------------------------------------------------------------------
+# SQS NEEDS ITS OWN TIMEOUT, AND FINDING OUT WHY COSTS AN HOUR IF YOU DON'T.
+#
+# `read_timeout` is the client saying: "if the server has not answered within
+# N seconds, assume it is broken and hang up." Ten seconds is generous for SNS
+# publish or a Postgres round trip — those answer in milliseconds.
+#
+# But SQS long polling is a service that IS SUPPOSED TO ANSWER SLOWLY. We ask
+# it to hold the line for up to 20 seconds waiting for a message. So with a
+# 10-second read timeout:
+#
+#       t=0s    consumer: "any messages? I'll wait up to 20s."
+#       t=10s   boto3:    "no answer in 10s, this is broken" -> hangs up
+#                         botocore.exceptions.ReadTimeoutError
+#       t=20s   SQS:      "...no, nothing." (talking to a closed socket)
+#
+# EVERY receive fails, forever, and the error says "Read timeout on endpoint
+# URL" — which reads like the network is down or LocalStack is dead. Neither is
+# true. We hung up on a service that was doing exactly what we asked.
+#
+# THE GENERAL LESSON: a timeout is an assertion about EXPECTED LATENCY. Sharing
+# one config across services with different latency profiles is a trap, and it
+# springs the moment you add the first deliberately-slow call. The margin
+# covers the network round trip on top of the wait itself.
+# ---------------------------------------------------------------------------
+_SQS_CONFIG = _BOTO_CONFIG.merge(
+    Config(read_timeout=config.SQS_WAIT_TIME_SECONDS + 10)
+)
+
+
 @lru_cache(maxsize=1)
 def sqs():
-    """Shared SQS client."""
-    return _client("sqs")
+    """Shared SQS client, with a read timeout that outlasts a long poll."""
+    return boto3.client(
+        "sqs",
+        endpoint_url=config.AWS_ENDPOINT_URL,
+        aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+        region_name=config.AWS_REGION,
+        config=_SQS_CONFIG,
+    )
 
 
 # ---------------------------------------------------------------------------
