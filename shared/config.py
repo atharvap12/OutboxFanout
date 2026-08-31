@@ -85,6 +85,11 @@ REDIS_URL = _get("REDIS_URL", f"redis://{REDIS_HOST}:{REDIS_PORT}/0")
 # Postgres consumers have no equivalent expiry.
 NOTIFY_DEDUP_TTL_SECONDS = _get_int("NOTIFY_DEDUP_TTL_SECONDS", 172_800)
 
+# Phase 5 fault injection: exit between the Redis SET and the send, proving the
+# key survives and the notification is genuinely lost. The mirror image of
+# CRASH_AFTER_PUBLISH, which loses nothing and duplicates instead.
+CRASH_AFTER_MARK = _get_bool("CRASH_AFTER_MARK", False)
+
 
 # --------------------------------------------------------------------------
 # AWS / LocalStack

@@ -1,0 +1,6 @@
+# Note what is ABSENT: SQLAlchemy and psycopg. This consumer never touches
+# Postgres, so its image contains no database driver at all — the "different
+# idempotency store" claim is true of the build, not just the code.
+
+redis>=5.0,<6.0
+boto3>=1.35,<2.0              # SQS client; botocore comes with it
