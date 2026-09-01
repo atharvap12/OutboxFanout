@@ -118,6 +118,19 @@ REDIS_URL = _get("REDIS_URL", f"redis://{REDIS_HOST}:{REDIS_PORT}/0")
 # equivalent expiry and dedupe forever.
 NOTIFY_DEDUP_TTL_SECONDS = _get_int("NOTIFY_DEDUP_TTL_SECONDS", 172_800)
 
+# Fault injection for Phase 5, and the exact mirror image of
+# CRASH_AFTER_PUBLISH above. Exits between the Redis SET and the "email sent"
+# side effect, so the key survives claiming a send that never happened.
+#
+# The two flags demonstrate OPPOSITE failures, which is the point of having
+# both:
+#   CRASH_AFTER_PUBLISH  ->  nothing lost, event DUPLICATED (relay)
+#   CRASH_AFTER_MARK     ->  nothing duplicated, notification LOST (notify)
+# Same class of crash, same kind of gap between two systems, opposite outcome —
+# because the two components chose opposite orderings, for reasons written up in
+# notifications/service.py. Default off; this deliberately breaks the consumer.
+CRASH_AFTER_MARK = _get_bool("CRASH_AFTER_MARK", False)
+
 
 # --------------------------------------------------------------------------
 # AWS / LocalStack

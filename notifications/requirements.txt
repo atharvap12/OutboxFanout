@@ -1,0 +1,16 @@
+# NOTICE WHAT IS MISSING: SQLAlchemy and psycopg.
+#
+# Billing and Shipping both need them. This consumer never touches Postgres, so
+# its image contains NO DATABASE DRIVER AT ALL — verifiable with
+# `python -c "import sqlalchemy"` inside the container, which raises
+# ModuleNotFoundError.
+#
+# That turns "the Notifications consumer uses a different idempotency store"
+# from a claim about the code into a fact about the BUILD. It cannot accidentally
+# grow a Postgres dependency without someone editing this file on purpose.
+#
+# Same reasoning as order/ being absent from all three consumer images: a
+# boundary you can enforce beats a boundary you have to remember.
+
+redis>=5.0,<6.0               # the dedup store
+boto3>=1.35,<2.0              # SQS client; botocore comes along with it
