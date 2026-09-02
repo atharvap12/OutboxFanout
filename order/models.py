@@ -14,6 +14,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     text,
@@ -94,11 +95,34 @@ class OutboxEvent(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # --- Phase 6: parking a row the relay can never publish ---------------
+    # Failed publish attempts. The relay stops selecting a row once this
+    # reaches OUTBOX_MAX_ATTEMPTS — a dead-letter queue for the outbox table,
+    # and the fix for head-of-line blocking (see relay/service.py).
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"), default=0
+    )
+
+    # Why it last failed, kept so a parked row can be diagnosed without
+    # re-running it. Truncated: some botocore messages are enormous.
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # When it was parked. NULL means "still being retried"; a value means the
+    # relay has given up and a human needs to look.
+    failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (
         # Partial index: contains only unpublished rows, and rows drop out of
         # it once marked published. Stays the size of the backlog rather than
         # of all history, which matters for a query the relay runs every 2s
         # forever.
+        #
+        # The predicate stays `published = false` and deliberately does NOT
+        # mention `attempts`: baking a threshold into an index would mean
+        # rebuilding the index to retune OUTBOX_MAX_ATTEMPTS. Postgres uses the
+        # index for the published check and filters attempts afterwards.
         Index(
             "ix_outbox_unpublished",
             "created_at",

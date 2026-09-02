@@ -1,0 +1,8 @@
+# Host-side test dependencies. These tests run OUTSIDE the containers and
+# drive the running stack through its published ports, which is deliberate:
+# a test that runs inside a container cannot stop that container.
+pytest>=8.0
+requests>=2.31        # POST /orders
+boto3>=1.35           # SQS/SNS assertions
+psycopg[binary]>=3.2  # Postgres assertions
+redis>=5.0            # Redis assertions

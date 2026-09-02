@@ -134,6 +134,12 @@ services:
       BILLING_QUEUE_NAME: ${BILLING_QUEUE_NAME:-billing-queue}
       SHIPPING_QUEUE_NAME: ${SHIPPING_QUEUE_NAME:-shipping-queue}
       NOTIFY_QUEUE_NAME: ${NOTIFY_QUEUE_NAME:-notify-queue}
+      # Phase 6: one DLQ per queue, plus how many deliveries before SQS gives
+      # up and moves a message there.
+      BILLING_DLQ_NAME: ${BILLING_DLQ_NAME:-billing-dlq}
+      SHIPPING_DLQ_NAME: ${SHIPPING_DLQ_NAME:-shipping-dlq}
+      NOTIFY_DLQ_NAME: ${NOTIFY_DLQ_NAME:-notify-dlq}
+      SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
       SQS_VISIBILITY_TIMEOUT_SECONDS: ${SQS_VISIBILITY_TIMEOUT_SECONDS:-30}
       SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
       # PG_PASSWORD is required by shared/config.py at import, though this
@@ -172,6 +178,10 @@ services:
       RELAY_POLL_INTERVAL_SECONDS: ${RELAY_POLL_INTERVAL_SECONDS:-2}
       RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-10}
       CRASH_AFTER_PUBLISH: ${CRASH_AFTER_PUBLISH:-0}   # Scenario A
+      # Phase 6: failed publish attempts before the relay parks a row and stops
+      # selecting it — a dead-letter queue for the outbox table, and the fix for
+      # head-of-line blocking.
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SQL_ECHO: ${SQL_ECHO:-0}
     depends_on:

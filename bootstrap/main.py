@@ -29,6 +29,15 @@ QUEUE_NAMES = (
     config.NOTIFY_QUEUE_NAME,
 )
 
+# Phase 6 / FR-07: each queue gets its OWN dead letter queue, never a shared
+# one. A poison message must be traceable to the consumer that could not handle
+# it — and one consumer filling a shared DLQ would bury the others' failures.
+DLQ_FOR = {
+    config.BILLING_QUEUE_NAME: config.BILLING_DLQ_NAME,
+    config.SHIPPING_QUEUE_NAME: config.SHIPPING_DLQ_NAME,
+    config.NOTIFY_QUEUE_NAME: config.NOTIFY_DLQ_NAME,
+}
+
 # Only OrderCreated exists today, so this filter accepts everything we publish
 # and changes nothing yet. It is here to show WHERE routing lives: give
 # notify-queue {"event_type": ["OrderCancelled"]} and it stops receiving
@@ -64,6 +73,32 @@ def _queue_attributes() -> dict[str, str]:
     }
 
 
+def _redrive_policy(dlq_arn: str) -> dict:
+    """Tell SQS to give up on a message after N deliveries and move it aside.
+
+    THE COUNTER IS DELIVERIES, NOT FAILURES. SQS cannot see whether a consumer
+    succeeded — it only knows the message was received and never deleted. So
+    ApproximateReceiveCount rises for a genuine crash, a handler that raised,
+    AND a handler that simply took longer than the visibility timeout. All
+    three look identical from the outside.
+
+    That is why maxReceiveCount must comfortably exceed the redeliveries a
+    HEALTHY consumer causes on its own; too low and ordinary slow work lands in
+    the DLQ. AWS's guidance is the same.
+
+    Note the DLQ is not a different kind of resource — it is an ordinary queue
+    that happens to be named as a redrive target. It gets no SNS subscription
+    and no queue policy, because SQS itself moves the message, not SNS.
+    https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
+    """
+    return {
+        "deadLetterTargetArn": dlq_arn,
+        # A JSON *number* in a string-valued attribute: the policy is itself
+        # JSON, so this ends up as {"maxReceiveCount": 5}, not "5".
+        "maxReceiveCount": config.SQS_MAX_RECEIVE_COUNT,
+    }
+
+
 def _queue_policy(queue_arn: str, topic_arn: str) -> dict:
     """Permission for SNS to write into this queue.
 
@@ -96,7 +131,7 @@ def _queue_policy(queue_arn: str, topic_arn: str) -> dict:
     }
 
 
-def ensure_queue(name: str) -> tuple[str, str]:
+def ensure_queue(name: str, dlq_arn: str | None = None) -> tuple[str, str]:
     """Create the queue if absent and apply its settings. Returns (url, arn).
 
     Created BARE, then configured, rather than passing attributes to
@@ -104,9 +139,17 @@ def ensure_queue(name: str) -> tuple[str, str]:
     exactly — call it again with a changed value and it raises
     QueueAlreadyExists. Splitting the two makes this re-runnable even after
     you edit a setting, which is the whole point of a bootstrap script.
+
+    `dlq_arn` attaches a redrive policy. Omitted when creating a DLQ itself —
+    a DLQ with its own DLQ is a chain nobody monitors.
     """
     url = aws.sqs().create_queue(QueueName=name)["QueueUrl"]
-    aws.sqs().set_queue_attributes(QueueUrl=url, Attributes=_queue_attributes())
+
+    attributes = _queue_attributes()
+    if dlq_arn is not None:
+        attributes["RedrivePolicy"] = json.dumps(_redrive_policy(dlq_arn))
+
+    aws.sqs().set_queue_attributes(QueueUrl=url, Attributes=attributes)
     arn = aws.queue_arn(url)
     log.info("queue %-16s ready  %s", name, arn)
     return url, arn
@@ -157,7 +200,13 @@ def main() -> int:
     log.info("topic %-16s ready  %s", config.SNS_TOPIC_NAME, topic_arn)
 
     for name in QUEUE_NAMES:
-        url, arn = ensure_queue(name)
+        # The DLQ must exist before the redrive policy can name its ARN, so it
+        # is created first. It is a plain queue: no subscription, no policy,
+        # and no redrive policy of its own.
+        dlq_name = DLQ_FOR[name]
+        _, dlq_arn = ensure_queue(dlq_name)
+
+        url, arn = ensure_queue(name, dlq_arn=dlq_arn)
         ensure_subscription(topic_arn, url, arn)
 
     # Verify rather than assume. Every call above could succeed while the
@@ -172,8 +221,35 @@ def main() -> int:
         log.error("expected queues are NOT subscribed: %s", ", ".join(sorted(missing)))
         return 1
 
+    # Verify the redrive policies as well, for the same reason the
+    # subscriptions are verified: every call above can succeed while the result
+    # is still wrong. A queue with no DLQ attached looks completely normal until
+    # a poison message arrives and loops forever.
+    for name in QUEUE_NAMES:
+        attributes = aws.sqs().get_queue_attributes(
+            QueueUrl=aws.queue_url(name), AttributeNames=["RedrivePolicy"]
+        ).get("Attributes", {})
+
+        if "RedrivePolicy" not in attributes:
+            log.error("queue %r has NO redrive policy — a poison message would loop forever", name)
+            return 1
+
+        policy = json.loads(attributes["RedrivePolicy"])
+        expected_dlq_arn = aws.queue_arn(aws.queue_url(DLQ_FOR[name]))
+        if policy.get("deadLetterTargetArn") != expected_dlq_arn:
+            log.error(
+                "queue %r redrives to %r, expected %r",
+                name, policy.get("deadLetterTargetArn"), expected_dlq_arn,
+            )
+            return 1
+
+        log.info(
+            "redrive %-14s -> %s after %s deliveries",
+            name, DLQ_FOR[name], policy.get("maxReceiveCount"),
+        )
+
     log.info(
-        "bootstrap complete — %d queues subscribed to %r",
+        "bootstrap complete — %d queues subscribed to %r, each with a DLQ",
         len(expected_arns), config.SNS_TOPIC_NAME,
     )
     return 0

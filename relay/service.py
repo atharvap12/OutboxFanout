@@ -15,7 +15,8 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from botocore.exceptions import ClientError
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from shared import config
@@ -30,6 +31,80 @@ log = get_logger(__name__)
 # Distinctive exit code so the Scenario A script can assert the process died
 # where we intended rather than for some unrelated reason.
 CRASH_EXIT_CODE = 17
+
+
+# SNS error codes that will fail identically no matter how many times we retry.
+# An oversized or malformed payload is not going to become valid on the third
+# attempt, so retrying only delays the inevitable while blocking the queue.
+#
+# The default for anything NOT listed here is TRANSIENT, deliberately. Guessing
+# "permanent" on an unfamiliar error would park healthy rows during an outage;
+# guessing "transient" only costs a few retries, and the attempts counter parks
+# the row eventually anyway. Bias the unknown toward retry.
+# https://docs.aws.amazon.com/sns/latest/api/CommonErrors.html
+_PERMANENT_SNS_ERRORS = frozenset({
+    "InvalidParameter",         # includes a payload over the 256 KB limit
+    "InvalidParameterValue",
+    "ParameterValueInvalid",
+    "EntityTooLarge",
+    "AuthorizationError",       # our IAM is wrong; retrying cannot fix it
+    "InvalidSecurity",
+    "KMSAccessDenied",
+    "KMSInvalidStateException",
+})
+
+
+def is_permanent(exc: BaseException) -> bool:
+    """True if retrying this exception is pointless.
+
+    Only ClientError carries an AWS error code. Connection timeouts, DNS
+    failures and read timeouts arrive as other botocore exceptions and are
+    always transient — the request never got an answer, so we cannot know
+    whether the payload was acceptable.
+    """
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code", "") in _PERMANENT_SNS_ERRORS
+    return False
+
+
+def record_failure(event_id, exc: BaseException, permanent: bool) -> int:
+    """Bump the attempt counter, and park the row if it is out of chances.
+
+    MUST run in its own transaction. The publish failed inside relay_one()'s
+    transaction, which session_scope then rolls back — so a counter incremented
+    in there would be discarded along with everything else, and the row would
+    retry forever with attempts stuck at 0. The bookkeeping about a failure
+    cannot live in the transaction the failure destroyed.
+    """
+    reason = f"{type(exc).__name__}: {exc}"[:500]
+
+    with session_scope() as session:
+        # A single UPDATE rather than read-modify-write: `attempts + 1`
+        # evaluated by Postgres is safe if two relays somehow both fail on the
+        # same row, where reading 3 and writing 4 twice would lose a count.
+        stmt = (
+            update(OutboxEvent)
+            .where(OutboxEvent.id == event_id)
+            .values(attempts=OutboxEvent.attempts + 1, last_error=reason)
+            .returning(OutboxEvent.attempts)
+        )
+        attempts = session.execute(stmt).scalar_one()
+
+        # Park immediately on a permanent error; otherwise only once the row
+        # has burned through its retries.
+        if permanent or attempts >= config.OUTBOX_MAX_ATTEMPTS:
+            session.execute(
+                update(OutboxEvent)
+                .where(OutboxEvent.id == event_id)
+                .values(failed_at=datetime.now(timezone.utc))
+            )
+            log.error(
+                "PARKED outbox row %s after %d attempt(s) (%s): %s — "
+                "it will no longer be selected; investigate and clear failed_at to retry",
+                event_id, attempts, "permanent error" if permanent else "retries exhausted", reason,
+            )
+
+    return attempts
 
 
 def pending_event_ids(session: Session, limit: int) -> list:
@@ -53,6 +128,11 @@ def pending_event_ids(session: Session, limit: int) -> list:
         # closer the expressions match the better. Confirm with EXPLAIN rather
         # than assuming — see VERIFY-PHASE-2.md.
         .where(OutboxEvent.published == False)  # noqa: E712
+        # Skip parked rows. This is the line that fixes head-of-line blocking:
+        # a row the relay has given up on drops out of the poll entirely, so
+        # the healthy rows queued behind it finally get their turn.
+        .where(OutboxEvent.failed_at.is_(None))
+        .where(OutboxEvent.attempts < config.OUTBOX_MAX_ATTEMPTS)
         .order_by(OutboxEvent.created_at)
         .limit(limit)
     )
@@ -170,13 +250,57 @@ def relay_batch() -> tuple[int, int]:
         try:
             if relay_one(event_id):
                 published += 1
-        except Exception:
-            # Abandon the rest of the batch instead of continuing. If SNS is
-            # unreachable the remaining rows fail identically, and each failure
-            # burns the full boto3 retry budget first — so pressing on turns a
-            # 2s poll into a minutes-long stall. The rows stay unpublished,
-            # which is the whole point of the outbox; the next poll retries.
-            log.exception("publish failed for outbox row %s — abandoning batch", event_id)
+        except Exception as exc:
+            # PHASE 6: the failure is classified before deciding what to do.
+            # This used to be a bare `break`, which treated every failure as
+            # "SNS is down" — and that was a real bug. See the note below.
+            permanent = is_permanent(exc)
+            record_failure(event_id, exc, permanent)
+
+            if permanent:
+                # This one row is broken; the others are fine. Skip it and
+                # keep draining. It is already parked, so it will not be
+                # selected again.
+                log.exception(
+                    "permanent publish failure for outbox row %s — parked, continuing batch",
+                    event_id,
+                )
+                continue
+
+            # Transient: assume SNS itself is unhealthy, so the remaining rows
+            # will fail identically — and each failure burns the full ~35s
+            # boto3 retry budget first, which would turn a 2s poll into a
+            # minutes-long stall. Give up on this cycle; the next poll retries.
+            log.exception("transient publish failure for outbox row %s — abandoning batch", event_id)
             break
 
     return published, len(event_ids)
+
+
+# WHY THE CLASSIFICATION EXISTS — the bug this fixed
+#
+# The old code was one bare `break` for every failure. Consider ten pending
+# rows where the FIRST has a payload SNS will never accept:
+#
+#   poll 1   row 1 fails -> break. Rows 2-10 untouched.
+#   poll 2   the batch is ORDER BY created_at, so row 1 is first again.
+#            Fails again. break again.
+#   ...forever.
+#
+# The outbox stops draining PERMANENTLY. No order placed after that moment is
+# ever published — while the relay logs an error every 2 seconds and otherwise
+# looks perfectly healthy: process up, database connected, polling on schedule.
+#
+# The name for one bad item blocking everything behind it is HEAD-OF-LINE
+# BLOCKING; the row itself is a POISON MESSAGE. Two things fix it here, and
+# either alone would be enough to stop the permanent stall:
+#
+#   1. `attempts` + `failed_at` — after OUTBOX_MAX_ATTEMPTS the row is parked
+#      and pending_event_ids() stops selecting it. This is exactly the DLQ
+#      idea that FR-07 applies to SQS, applied one hop upstream to the table.
+#   2. Classification — a KNOWN-permanent error parks the row on the first
+#      attempt instead of stalling the batch five more times first.
+#
+# Deliberately NOT automatic: a parked row stays parked until a human clears
+# `failed_at`. Silently discarding an event the system promised to deliver is
+# the one thing this whole architecture exists to prevent.

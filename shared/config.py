@@ -112,6 +112,17 @@ BILLING_QUEUE_NAME = _get("BILLING_QUEUE_NAME", "billing-queue")
 SHIPPING_QUEUE_NAME = _get("SHIPPING_QUEUE_NAME", "shipping-queue")
 NOTIFY_QUEUE_NAME = _get("NOTIFY_QUEUE_NAME", "notify-queue")
 
+# Dead letter queues (Phase 6, FR-07). One per main queue, never shared: a
+# poison message must be traceable to the consumer that could not handle it.
+BILLING_DLQ_NAME = _get("BILLING_DLQ_NAME", "billing-dlq")
+SHIPPING_DLQ_NAME = _get("SHIPPING_DLQ_NAME", "shipping-dlq")
+NOTIFY_DLQ_NAME = _get("NOTIFY_DLQ_NAME", "notify-dlq")
+
+# Deliveries before SQS moves a message to the DLQ. Must exceed the number of
+# redeliveries a healthy consumer causes on its own (a slow handler that
+# overruns the visibility timeout), or ordinary work lands in the DLQ.
+SQS_MAX_RECEIVE_COUNT = _get_int("SQS_MAX_RECEIVE_COUNT", 5)
+
 
 # --------------------------------------------------------------------------
 # Relay
@@ -123,6 +134,17 @@ RELAY_BATCH_SIZE = _get_int("RELAY_BATCH_SIZE", 10)
 # Scenario A: exit after publishing to SNS but before marking the row
 # published, so the row is republished on restart and consumers must no-op.
 CRASH_AFTER_PUBLISH = _get_bool("CRASH_AFTER_PUBLISH", False)
+
+# A DLQ for the OUTBOX TABLE — the same idea as SQS's redrive policy, applied
+# one hop upstream. After this many failed publish attempts the relay stops
+# selecting the row ("parks" it) instead of retrying forever.
+#
+# Fixes a real bug: the batch is ORDER BY created_at, so a row SNS will never
+# accept (oversized payload, say) sits first in every batch forever, and the
+# old bare `break` abandoned every healthy row behind it. The outbox stopped
+# draining permanently while the relay logged an error every 2s and otherwise
+# looked healthy. That failure has a name: HEAD-OF-LINE BLOCKING.
+OUTBOX_MAX_ATTEMPTS = _get_int("OUTBOX_MAX_ATTEMPTS", 5)
 
 
 # --------------------------------------------------------------------------
